@@ -1,3 +1,9 @@
+# Setup
+!pip install --upgrade pip
+!pip install pyspark==3.4.1
+!pip install spark-nlp==5.1.4
+!pip install -q transformers presidio-analyzer presidio-anonymizer
+
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, udf, explode, regexp_replace, lit, collect_list, expr, avg, count, max as spark_max
 from pyspark.sql.types import ArrayType, StructType, StructField, StringType, FloatType
@@ -182,7 +188,7 @@ schema = ArrayType(StructType([
 filtered_udf = udf(custom_entity_filter, schema)
 entity_df = processed_df.withColumn("entity_info", filtered_udf("entities")).withColumn("entity", explode("entity_info"))
 # Keeps rows with confidence of 0.7 or higher
-entity_df = entity_df.filter(col("entity.confidence") >= 0.75)
+entity_df = entity_df.filter(col("entity.confidence") >= 0.70)
 
 # Final table of entities
 pii_table = entity_df.select(
@@ -201,43 +207,31 @@ entity_summary = entity_df.groupBy("entity.entity").agg(
 
 print("\n Presidio Redaction Layer")
 from presidio_analyzer import AnalyzerEngine, RecognizerResult, EntityRecognizer, AnalysisExplanation
+original_texts = entity_df.select("text").distinct().collect()
+data = [(text[0].lower(), text[0]) for text in original_texts]  
 
 regex_redactions = [
     # Aadhaar - flexible spacing
     (r"(?i)\b(?:aadhaar(?:\s*(?:no|number|num)\.?\s*[:\-]?)?\s*)?((?:\d{4}[\s\-]*){3}|\d{12})\b", "[AADHAAR]"),
 
     # Phone numbers - flexible spacing and formats
-    (r"(?i)\b(?:phone|mobile|mob\.?|contact|patient\s*mob\.?\s*no\.?)\s*[:.-]?\s*\+?91?[-\s]?[6-9]\d{9}\b|\b[6-9]\d{9}\b", "[PHONE]"),
+    (r"(?i)\b(?:(?:phone|mobile|mob|call\s*on|contact)[\s:.-]*)?(?:\+?91[\s-]?)?[6-9]\d{1,4}[\s-]?\d{3,4}[\s-]?\d{4}\b", "[PHONE]"),
 
     # Email - case insensitive
     (r"(?i)\b[\w\.-]+@[\w\.-]+\.\w+\b", "[EMAIL]"),
 
     # Patient and hospital IDs - case insensitive, flexible spacing and separators
-    (r"""(?ix)
-\b
-(?:
-    (?:mr[dn]|uhid|reg(?:istration)?|hospital|episode|kmc)
-    \s* (?:no\.?|number|num\.?)? 
-    \s*[:.\-]?\s* 
-    ([a-z0-9\-]+)                  # alphanumeric + dash
-  |
-    (\w+@uidai)                    # UIDAI email-like pattern
-  |
-    (\b\d{2,4}[\s\-]*\d{2,4}[\s\-]*\d{2,4}[\s\-]*\d{2,4}\b)  # digit blocks 
-  |
-    ([a-z]{2,5}[\s\-]*\d{4,8})   
-)
-""", "[ID]"),
+    (r"""(?ix) \b (?:(?:mr[dn]|uhid|reg(?:istration)?\.?\s*no\.?|hospital\.?\s*no\.?|episode\.?\s*no\.?|patient\s*(?:id|no)\.?)\s*[:-]?\s*(?:[a-z0-9\-]+|(?:[a-z]{2}\d{7,10})))""", "[ID]"),
 
     # Dates - various formats
     (r"(?i)\b\d{1,2,4}[\s\-\/]\d{1,2}[\s\-\/]\d{2,4}\b", "[DOB]"),
     (r"(?i)\b\d{1,2}(st|nd|rd|th)?[-\s]?(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[-\s]?\d{2,4}\b", "[DOB]"),
 
     # Age (standalone or with variations)
-    (r"(?i)\b(age|ag|age/sex|ag/sex)?\s*[:\-]?\s*\d{1,3}\s*(yrs?|years)?\b", "[AGE]"),
+    (r"(?i)\b(?:age|ag|age/sex|ag/sex|age\s*[:/-]\s*sex)\s*[:\-]?\s*\d{1,3}\s*(?:yrs?|years?)?\b", "[AGE]"),
 
     # Gender (standalone or in combo)
-    (r"(?i)\b(sex|gender|age/sex|ag/sex)?\s*[:\-]?\s*(male|female|transgender|m|f)\b", "[GENDER]"),
+    (r"(?i)\b(?:sex|gender|age/sex|ag/sex|age\s*[:/-]\s*sex)\s*[:\-]?\s*(?:male|female|transgender|m|f)\b", "[GENDER]"),
 
     # PIN codes
     (r"\b\d{6}\b", "[PIN_CODE]"),
@@ -319,37 +313,139 @@ class UHIDRecognizer(EntityRecognizer):
                 results.append(result)
 
         return results
-class HospitalNoRecognizer(EntityRecognizer):
+
+from presidio_analyzer import EntityRecognizer, RecognizerResult, AnalysisExplanation
+import re
+
+class ComprehensiveIdRecognizer(EntityRecognizer):
     def __init__(self):
-        super().__init__(supported_entities=["HOSPITAL_NO"])
-        self.context = ["hospital no", "record id"]
+        # Supported entity type (use "ID" or custom type like "MEDICAL_RECORD")
+        super().__init__(supported_entities=["ID"])
+        
+        # Context phrases that often appear near medical IDs
+        self.context_phrases = [
+            "mrno", "uhid", "registration", "hospital", 
+            "episode", "kmc", "no", "number", "medical record", "uidai"
+        ]
+        
+        # Your original regex pattern (converted to work with Python)
+        self.pattern = re.compile(r"""(?ix)
+\b
+(?:
+    # Prefixes: UHID, MRN, Episode, Hospital, KMC, etc.
+    (?:mr[dn]|uhid|reg(?:istration)?|hospital|episode|kmc)
+    \s*(?:no\.?|number|num\.?)?     
+    \s*[:.\-]?\s*
+    ([a-z0-9\-]{4,20})             
+
+  | # UIDAI emails
+    (\w+@uidai)
+
+  | # Loose digit blocks 
+    (\b\d{4}[\s\-]?\d{4,6}[\s\-]?\d{2,6}\b)
+
+  | # alphanumeric values
+    ([a-z]{2,5}[\s\-]*\d{4,8})
+)
+""", re.VERBOSE)
 
     def load(self):
-        pass
+        pass  # No external resources to load
 
     def analyze(self, text, entities, nlp_artifacts):
-        pattern = re.compile(r"\b[A-Z]{2}\d{6,}\b")
+        results = []
+        
+        for match in self.pattern.finditer(text):
+            # Extract the matched group that actually contains the ID
+            matched_id = next((group for group in match.groups() if group), None)
+            if not matched_id:
+                continue
+                
+            # Check surrounding context (50 chars before/after)
+            window = text[max(0, match.start()-50):match.end()+50].lower()
+            
+            # Verify at least one context phrase exists near the match
+            if any(ctx in window for ctx in self.context_phrases):
+                explanation = AnalysisExplanation(
+                    recognizer=self.__class__.__name__,
+                    original_score=0.9,
+                    textual_explanation=f"Medical ID detected near '{window[:30]}...'"
+                )
+                
+                results.append(
+                    RecognizerResult(
+                        entity_type="ID",
+                        start=match.start(),
+                        end=match.end(),
+                        score=0.9,  # High confidence due to context
+                        analysis_explanation=explanation
+                    )
+                )
+        
+        return results
+
+class EnhancedPhoneRecognizer(EntityRecognizer):
+    def __init__(self):
+        super().__init__(supported_entities=["PHONE_NUMBER"])
+        self.context_phrases = ["phone", "call on", "mobile", "mob no", "mob", "contact", "number", "no.", "telephone"]
+
+    def analyze(self, text, entities, nlp_artifacts):
+        # Regex: Supports +91, spaces, hyphens, and optional prefixes
+        pattern = re.compile(
+            r"""(?x)           
+            (?:\+91\s?)?                # Optional +91 prefix
+            [6-9]\d{4}                  
+            [\s-]?                    
+            \d{5}                      
+            |                    
+            [6-9]\d{9}                  # Plain 10-digit number (9876543210)
+            """
+        )
         results = []
 
         for match in pattern.finditer(text):
-            window = text[max(0, match.start()-20):match.end()+20].lower()
-
-            if any(ctx in window for ctx in self.context):
-                explanation = AnalysisExplanation(
-                    recognizer="HospitalNoRecognizer",
-                    original_score=0.85,
-                    textual_explanation="Hospital number detected using regex with context"
+            window = text[max(0, match.start()-30):match.end()+30].lower()
+            if any(ctx in window for ctx in self.context_phrases):
+                results.append(
+                    RecognizerResult(
+                        entity_type="PHONE",
+                        start=match.start(),
+                        end=match.end(),
+                        score=0.9
+                    )
                 )
+        return results
 
-                result = RecognizerResult(
-                    entity_type="ID",
-                    start=match.start(),
-                    end=match.end(),
-                    score=0.85,
-                    analysis_explanation=explanation
+class AgeGenderRecognizer(EntityRecognizer):
+    def __init__(self):
+        super().__init__(supported_entities=["AGE", "GENDER"])
+        self.context_phrases = ["age", "sex", "gender"]
+
+    def analyze(self, text, entities, nlp_artifacts):
+        results = []
+        # Age pattern (e.g., "Age: 58", "58 yrs")
+        pattern = re.compile(
+            r"(?i)\b(?:age\s?[/-]?\s?sex|age)\s*[:=]?\s*(\d{1,3})\s*(?:yrs?|years?)?\s*[/-]?\s*(male|female|m|f)\b"
+        )        
+        for match in pattern.finditer(text):
+            window = text[max(0, match.start()-50):match.end()+50]
+            age_start, age_end = match.start(1), match.end(1)
+            gender_start, gender_end = match.start(2), match.end(2)
+
+            results.extend([
+                RecognizerResult(
+                    entity_type="AGE",
+                    start=age_start,
+                    end=age_end,
+                    score=0.9
+                ),
+                RecognizerResult(
+                    entity_type="GENDER",
+                    start=gender_start,
+                    end=gender_end,
+                    score=0.9
                 )
-                results.append(result)
-
+            ])
         return results
 
 class MRNRecognizer(EntityRecognizer):
@@ -361,7 +457,7 @@ class MRNRecognizer(EntityRecognizer):
         pass
 
     def analyze(self, text, entities, nlp_artifacts):
-        pattern = re.compile(r"\bMR[N|D][-:]?\d+\b", re.IGNORECASE)
+        pattern = re.compile(r"\bmr[n|d][-:]?\d+\b", re.IGNORECASE)
         results = []
 
         for match in pattern.finditer(text):
@@ -395,7 +491,7 @@ class NameRecognizer(EntityRecognizer):
         pass
 
     def analyze(self, text, entities, nlp_artifacts):
-        pattern = re.compile(r"\b(?:Dr|Mr|Mrs|Ms|Prof|Col|Maj)\.\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b")
+        pattern = re.compile(r"\b(?:dr|mr|mrs|ms|prof|col|maj)\.\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b")
         results = []
 
         for match in pattern.finditer(text):
@@ -404,7 +500,7 @@ class NameRecognizer(EntityRecognizer):
             if any(ctx in window for ctx in self.context):
                 explanation = AnalysisExplanation(
                     recognizer="NameRecognizer",
-                    original_score=0.85,
+                    original_score=0.88,
                     textual_explanation="Name with prefix detected using regex"
                 )
 
@@ -412,7 +508,7 @@ class NameRecognizer(EntityRecognizer):
                     entity_type="NAME",
                     start=match.start(),
                     end=match.end(),
-                    score=0.85,
+                    score=0.88,
                     analysis_explanation=explanation
                 )
                 results.append(result)
@@ -426,7 +522,9 @@ analyzer.registry.load_predefined_recognizers()
 
 # Adding custom recognizers
 analyzer.registry.add_recognizer(UHIDRecognizer())
-analyzer.registry.add_recognizer(HospitalNoRecognizer())
+analyzer.registry.add_recognizer(ComprehensiveIdRecognizer())
+analyzer.registry.add_recognizer(EnhancedPhoneRecognizer())
+analyzer.registry.add_recognizer(AgeGenderRecognizer())
 analyzer.registry.add_recognizer(MRNRecognizer())
 analyzer.registry.add_recognizer(NameRecognizer())
 
