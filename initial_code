@@ -1,0 +1,559 @@
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, udf, explode, regexp_replace, lit, collect_list, expr, avg, count, max as spark_max
+from pyspark.sql.types import ArrayType, StructType, StructField, StringType, FloatType
+from sparknlp.base import DocumentAssembler
+from sparknlp.annotator import Tokenizer, WordEmbeddingsModel, NerDLModel, NerConverter
+from pyspark.ml import Pipeline
+from transformers import pipeline as hf_pipeline
+from presidio_analyzer import AnalyzerEngine, PatternRecognizer, Pattern
+from presidio_anonymizer import AnonymizerEngine
+import logging
+import re
+
+# Initialize Spark session
+spark = SparkSession.builder \
+    .appName("Indian_Hospital_PII_Redaction") \
+    .config("spark.jars.packages", "com.johnsnowlabs.nlp:spark-nlp_2.12:4.2.8") \
+    .getOrCreate()
+
+# Sample Indian hospital text
+data = [
+    ("OUT PATIENT RECORD - SURGICAL ONCOLOGY. ",),
+    ("Patient Name: Mrs Sandhya PUVVALA, Age/Sex: 43 Yrs / Female, Episode No.: 00000851378. ",),
+    ("Hospital No.: MH000731649, Date: 2022-06-08 10:52, Patient Mob. No.: 9611827350, ",),
+    ("E-mail ID: sandhya.puvvala@gmail.com. ",),
+    ("Consultant Name: DR. SHABBER ZAVERI (MBBS-92, MS-97, Mch.(Surgical Oncology)-01). ",),
+    ("KMC Reg No.: 33660, Dept: ONCOLOGY SURGICAL MHB. ",),
+    ("Doctor's Notes: K/c/o IDC (E) breast C Tz-m/fo, stage IIB. ",),
+    ("PE: 916 HKI-mv-ng C14 Hypothermia K/G 7-50 l. ",),
+    ("S/P (E) RCs + Subpec + ALND + IIGAP flap encapsab C Tz PMG 22/10 41, H161Gr Cn 12/12/2020. ",),
+    ("s/P Adj-chemo - AC x 4 pack x q - test 14/3/2020 Leq: 2y-2012-dnon-acid 22/12/21. ",),
+    ("s/P Adj - RT - Goby 15# - test 14/19/2020. Started Aromatin from 15/8/2020. ",),
+    ("14/3/22 B/t Mammogram - B/RADS 2 on visit breast. ",),
+    ("USG - Med a pellu -> uterine fibroid 2.7 x 2.1 cm on follow up. ",),
+    ("PE: ESR-0 No ccn (B) Breast - Nk-NAD Lungs-thy due health. No polyoble lung. ",),
+    ("(B) Axilla - NAD No (B) upper limb lymphadenism. ",),
+    ("T - Aromatin 2.5 OD, T - Thyronorm 50mg OD, Tablet D3 Zoledronic Acid 4mg today. ",),
+    ("Manipal Hospital, HAL Airport Road, #98 HAL Airport Road, Bangalore 560017. ",),
+    ("Website: www.manipalhospitals.com, Email-Id: info@manipalhospitals.com. ",),
+    ("Phone: For booking an appointment/enquiry, call on: 1800 102 5555 / 1800 102 3222. ",),
+    ("For Home Care, call on: 1800 102 6070. ",),
+
+    ("OUT PATIENT RECORD - CARDIOLOGY. ",),
+    ("Patient Name: Mr Rajesh KUMAR, Age/Sex: 58 Yrs / Male, Episode No.: 00000852147. ",),
+    ("Hospital No.: MH000732891, Date: 2022-07-15 14:30, Patient Mob. No.: 9876543210, ",),
+    ("E-mail ID: rajesh.kumar@hotmail.com. ",),
+    ("Consultant Name: DR. PRIYA SHARMA (MBBS-88, MD-93, DM.(Cardiology)-96). ",),
+    ("KMC Reg No.: 41257, Dept: CARDIOLOGY MHB. ",),
+    ("Doctor's Notes: K/c/o CAD with STEMI, s/p PCI to LAD. ",),
+    ("PE: BP 140/90 mmHg, HR 78/min, SpO2 98% RA. No acute distress. ",),
+    ("S/P Primary PCI to LAD with DES implantation on 12/7/2022. EF: 45% on Echo. ",),
+    ("Currently on dual antiplatelet therapy - Aspirin 75mg + Clopidogrel 75mg OD. ",),
+    ("s/P Cardiac rehab program initiated. Lipid profile normal on statins. ",),
+    ("Follow up ECG - NSR, no new ST changes. Troponin levels normalized. ",),
+    ("2D Echo - RWMA in anterior wall, EF 45%, no regional wall motion abnormalities. ",),
+    ("PE: CVS - S1S2 heard, no murmurs. Chest clear. No pedal edema. ",),
+    ("Peripheral pulses palpable. No signs of heart failure. ",),
+    ("T - Metoprolol 50mg BD, T - Atorvastatin 40mg OD, T - Aspirin 75mg OD, T - Clopidogrel 75mg OD. ",),
+    ("Apollo Hospital, Bannerghatta Road, #154/11 Bannerghatta Road, Bangalore 560076. ",),
+    ("Website: www.apollohospitals.com, Email-Id: info@apollobangalore.com. ",),
+    ("Phone: For booking an appointment/enquiry, call on: 1860 500 1066 / 080 2630 2630. ",),
+    ("For Emergency services, call on: 1066. ",),
+
+    ("OUT PATIENT RECORD - ORTHOPEDICS. ",),
+    ("Patient Name: Mrs Lakshmi NAIR, Age/Sex: 65 Yrs / Female, Episode No.: 00000853299. ",),
+    ("Hospital No.: MH000733672, Date: 2022-08-22 09:15, Patient Mob. No.: 9445612378, ",),
+    ("E-mail ID: lakshmi.nair@yahoo.in. ",),
+    ("Consultant Name: DR. MOHAN RAO (MBBS-89, MS.(Ortho)-94, DNB-98). ",),
+    ("KMC Reg No.: 38924, Dept: ORTHOPEDICS MHB. ",),
+    ("Doctor's Notes: K/c/o Osteoarthritis (B) knees, Grade III changes. ",),
+    ("PE: Gait antalgic, uses walking stick. (B) knee effusion present. ",),
+    ("S/P Conservative management with physiotherapy and analgesics for 2 years. ",),
+    ("Recent X-ray shows progression of joint space narrowing and osteophyte formation. ",),
+    ("s/P Intra-articular steroid injection (R) knee 3 months back with temporary relief. ",),
+    ("MRI (B) knees - Severe cartilage loss, subchondral sclerosis, meniscal tears. ",),
+    ("Patient counseled regarding Total Knee Replacement surgery options. ",),
+    ("PE: ROM (R) knee 0-90 degrees, (L) knee 0-95 degrees. Crepitus present. ",),
+    ("No signs of infection. Distal pulses palpable. Neurologically intact. ",),
+    ("T - Paracetamol 650mg TDS, T - Glucosamine 750mg BD, Cap - Calcium+D3 OD. ",),
+    ("Fortis Hospital, Cunningham Road, #14 Cunningham Road, Bangalore 560052. ",),
+    ("Website: www.fortishealthcare.com, Email-Id: info@fortisbangalore.com. ",),
+    ("Phone: For booking an appointment/enquiry, call on: 0804 6794 6794 / 1800 102 6767. ",),
+    ("For Ambulance services, call on: 102. ",),
+
+    ("OUT PATIENT RECORD - ENDOCRINOLOGY. ",),
+    ("Patient Name: Mr Suresh REDDY, Age/Sex: 52 Yrs / Male, Episode No.: 00000854125. ",),
+    ("Hospital No.: MH000734458, Date: 2022-09-10 11:45, Patient Mob. No.: 9123456789, ",),
+    ("E-mail ID: suresh.reddy@gmail.com. ",),
+    ("Consultant Name: DR. KAVITHA MENON (MBBS-91, MD-96, DM.(Endocrinology)-00). ",),
+    ("KMC Reg No.: 42831, Dept: ENDOCRINOLOGY MHB. ",),
+    ("Doctor's Notes: K/c/o T2DM since 10 years, HTN since 5 years, Dyslipidemia. ",),
+    ("PE: BMI 28.5 kg/m2, BP 150/95 mmHg, FBS 145 mg/dl, PPBS 210 mg/dl. ",),
+    ("S/P Multiple antidiabetic medications over years. Recent HbA1c 8.2%. ",),
+    ("Diabetic retinopathy screening - Mild NPDR (B) eyes. Microalbuminuria present. ",),
+    ("s/P Dietary counseling and lifestyle modifications advised repeatedly. ",),
+    ("Recent lipid profile - TC 220, TG 180, HDL 35, LDL 145 mg/dl. ",),
+    ("Thyroid function tests - TSH 3.2 mIU/L, T3 T4 normal. eGFR 75 ml/min. ",),
+    ("PE: Fundus - Mild dot hemorrhages (B) eyes. Feet examination normal. ",),
+    ("No diabetic foot ulcers. Peripheral neuropathy assessment negative. ",),
+    ("T - Metformin 1000mg BD, T - Glimepiride 2mg OD, T - Amlodipine 5mg OD, T - Atorvastatin 20mg OD. ",),
+    ("Columbia Asia Hospital, Hebbal, #Kirloskar Business Park, Hebbal, Bangalore 560024. ",),
+    ("Website: www.columbiaasia.com, Email-Id: info@columbiaasia.com. ",),
+    ("Phone: For booking an appointment/enquiry, call on: 080 6132 0000 / 1800 103 4530. ",),
+    ("For Health Check packages, call on: 080 6132 0000. ",),
+
+    ("OUT PATIENT RECORD - GASTROENTEROLOGY. ",),
+    ("Patient Name: Mrs Priya SHARMA, Age/Sex: 38 Yrs / Female, Episode No.: 00000855367. ",),
+    ("Hospital No.: MH000735291, Date: 2022-10-05 16:20, Patient Mob. No.: 9987654321, ",),
+    ("E-mail ID: priya.sharma@outlook.com. ",),
+    ("Consultant Name: DR. ARUN KUMAR (MBBS-93, MD-98, DM.(Gastroenterology)-02). ",),
+    ("KMC Reg No.: 45672, Dept: GASTROENTEROLOGY MHB. ",),
+    ("Doctor's Notes: K/c/o GERD, Chronic gastritis, H.pylori positive. ",),
+    ("PE: Epigastric tenderness present. No hepatosplenomegaly. Bowel sounds normal. ",),
+    ("S/P Upper GI Endoscopy - Grade B esophagitis, antral gastritis, H.pylori positive. ",),
+    ("Triple therapy for H.pylori eradication completed 4 weeks back. ",),
+    ("s/P PPI therapy ongoing. Lifestyle modifications counseled regarding diet. ",),
+    ("Recent H.pylori stool antigen test - Negative (post-treatment). ",),
+    ("USG Abdomen - Normal liver, GB, pancreas. No focal lesions identified. ",),
+    ("PE: Abdomen soft, non-tender. No masses palpable. No ascites. ",),
+    ("Patient reports significant improvement in symptoms post H.pylori treatment. ",),
+    ("T - Pantoprazole 40mg OD, T - Domperidone 10mg TDS, Syr - Sucralfate 10ml TDS. ",),
+    ("Narayana Health City, Bommasandra, #258/A Bommasandra Industrial Area, Bangalore 560099. ",),
+    ("Website: www.narayanahealth.org, Email-Id: info@narayanahealth.org. ",),
+    ("Phone: For booking an appointment/enquiry, call on: 080 7122 4444 / 1800 102 9999. ",),
+    ("For International patients, call on: +91 80 7122 4567. ",),
+]
+
+df = spark.createDataFrame(data, ["text"])
+
+# Spark NLP Pipeline
+document_assembler = DocumentAssembler().setInputCol("text").setOutputCol("document")
+tokenizer = Tokenizer().setInputCols(["document"]).setOutputCol("token")
+embeddings = WordEmbeddingsModel.pretrained("glove_100d").setInputCols(["document", "token"]).setOutputCol("embeddings")
+ner_model = NerDLModel.pretrained("ner_dl", "en").setInputCols(["document", "token", "embeddings"]).setOutputCol("ner").setIncludeConfidence(True)
+ner_converter = NerConverter().setInputCols(["document", "token", "ner"]).setOutputCol("entities")
+
+pipeline = Pipeline(stages=[document_assembler, tokenizer, embeddings, ner_model, ner_converter])
+model = pipeline.fit(df)
+processed_df = model.transform(df).cache()
+
+# Context keywords for ORG to be remapped to ADDRESS
+ORG_CONTEXT_TERMS = ["hospital", "clinic", "labs", "insurance", "ltd", "limited", "centre", "center"]
+
+# Remapping and filtering entities
+def custom_entity_filter(entities):
+    results = []
+    for ent in entities:
+        word = ent.result
+        label = ent.metadata.get("entity", "").strip("<>").upper()
+        confidence = float(ent.metadata.get("confidence", 0.0))
+
+        # Filter out MISC
+        if label == "MISC":
+            continue
+
+        # Remap PER → NAME
+        if label == "PER":
+            label = "NAME"
+
+        # Remap LOC → ADDRESS
+        elif label == "LOC":
+            label = "ADDRESS"
+
+        # Remap ORG → ADDRESS only if context matches
+        elif label == "ORG":
+            lowered = word.lower()
+            if any(term in lowered for term in ORG_CONTEXT_TERMS):
+                label = "ADDRESS"
+            else:
+                # skip if it doesn't match context
+                continue  
+        results.append((word, label, confidence))
+    return results
+
+# Update schema 
+schema = ArrayType(StructType([
+    StructField("word", StringType()),
+    StructField("entity", StringType()),
+    StructField("confidence", FloatType())
+]))
+
+# Using a new UDF
+filtered_udf = udf(custom_entity_filter, schema)
+entity_df = processed_df.withColumn("entity_info", filtered_udf("entities")).withColumn("entity", explode("entity_info"))
+# Keeps rows with confidence of 0.7 or higher
+entity_df = entity_df.filter(col("entity.confidence") >= 0.70)
+
+# Final table of entities
+pii_table = entity_df.select(
+    col("entity.word").alias("detected_pii"),
+    col("entity.entity").alias("entity_type"),
+    col("entity.confidence").alias("confidence_score")
+).distinct().orderBy(col("confidence_score").desc())
+
+# Entity summary metrics
+entity_summary = entity_df.groupBy("entity.entity").agg(
+    count("*").alias("count"),
+    avg("entity.confidence").alias("avg_confidence"),
+    spark_max("entity.confidence").alias("max_confidence")
+).orderBy("count", ascending=False)
+
+
+print("\n Presidio Redaction Layer")
+from presidio_analyzer import AnalyzerEngine, RecognizerResult, EntityRecognizer, AnalysisExplanation
+
+regex_redactions = [
+    # Aadhaar - flexible spacing
+    (r"(?i)\b(?:aadhaar(?:\s*(?:no|number|num)\.?\s*[:\-]?)?\s*)?((?:\d{4}[\s\-]*){3}|\d{12})\b", "[AADHAAR]"),
+
+    # Phone numbers - flexible spacing and formats
+    (r"(?i)\b(?:phone|mobile|mob\.?|contact|patient\s*mob\.?\s*no\.?)\s*[:.-]?\s*\+?91?[-\s]?[6-9]\d{9}\b|\b[6-9]\d{9}\b", "[PHONE]"),
+
+    # Email - case insensitive
+    (r"(?i)\b[\w\.-]+@[\w\.-]+\.\w+\b", "[EMAIL]"),
+
+    # Patient and hospital IDs - case insensitive, flexible spacing and separators
+    (r"""(?ix)
+\b
+(?:
+    (?:mr[dn]|uhid|reg(?:istration)?|hospital|episode|kmc)
+    \s* (?:no\.?|number|num\.?)? 
+    \s*[:.\-]?\s* 
+    ([a-z0-9\-]+)                  # alphanumeric + dash
+  |
+    (\w+@uidai)                    # UIDAI email-like pattern
+  |
+    (\b\d{2,4}[\s\-]*\d{2,4}[\s\-]*\d{2,4}[\s\-]*\d{2,4}\b)  # digit blocks 
+  |
+    ([a-z]{2,5}[\s\-]*\d{4,8})   
+)
+""", "[ID]"),
+
+    # Dates - various formats
+    (r"(?i)\b\d{1,2,4}[\s\-\/]\d{1,2}[\s\-\/]\d{2,4}\b", "[DOB]"),
+    (r"(?i)\b\d{1,2}(st|nd|rd|th)?[-\s]?(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[-\s]?\d{2,4}\b", "[DOB]"),
+
+    # Age (standalone or with variations)
+    (r"(?i)\b(age|ag|age/sex|ag/sex)?\s*[:\-]?\s*\d{1,3}\s*(yrs?|years)?\b", "[AGE]"),
+
+    # Gender (standalone or in combo)
+    (r"(?i)\b(sex|gender|age/sex|ag/sex)?\s*[:\-]?\s*(male|female|transgender|m|f)\b", "[GENDER]"),
+
+    # PIN codes
+    (r"\b\d{6}\b", "[PIN_CODE]"),
+
+    # Names with titles - case insensitive, flexible spacing
+    (r"(?i)\b(?:dr\.?|mr\.?|mrs\.?|ms\.?|col\.?|prof\.?|shri|smt|miss|master|md\.?)\s+[a-z]+(?:[\s\-]+[a-z]+)*\b", "[NAME]"),
+
+    # PAN - case insensitive
+    (r"(?i)\b[a-z]{5}[\s\-]*\d{4}[\s\-]*[a-z]\b", "[PAN]"),
+
+    # Passport - case insensitive
+    (r"(?i)\b[a-pr-wy]\d{7}\b", "[PASSPORT]"),
+
+    # IP Address
+    (r"\b(?:\d{1,3}\.){3}\d{1,3}\b", "[IP_ADDRESS]"),
+
+    # URLs - case insensitive
+    (r"(?i)https?:\/\/(?:www\.)?[-\w\.-]+\.[a-z]{2,6}\b|www\.[-\w\.-]+\.[a-z]{2,6}\b", "[URL]"),
+
+    # Bank Account
+    (r"\b\d{2,4}[\s\-]*\d{2,4}[\s\-]*\d{2,4}[\s\-]*\d{2,4}\b", "[BANK_ACCOUNT]"),
+
+    # Address components (street, sector, block, etc.) with flexible spacing
+    (
+        r"(?i)\b(?:flat|house|h\.?\s*no\.?|quarter|apt|apartment|floor|block|sector|plot|cantonment|"
+        r"lane|road|street|st|nagar|residency|chowk|galli|bazar|mandal|ward|taluka|tehsil|mohalla|"
+        r"vihar|bhawan|gram|samiti|line|layout|colony|avenue|enclave|bypass|cross|expressway)"
+        r"\s*[\w\s,/-]{0,100}",
+        "[ADDRESS]"
+    ),
+
+    # Addresses ending with 6-digit PIN codes
+    (
+        r"(?i)(?:house|flat|h\.?\s*no\.?|apt|sector|block|plot|lane|street|road|nagar|colony|area)"
+        r"\s*[\w\s,/-]{0,100}?\s*\d{6}\b",
+        "[ADDRESS]"
+    ),
+
+    # Addresses prefixed with "address:" or similar labels, with flexible spacing
+    (
+        r"(?i)\b(?:address|addr|residence)\s*[:\-]?\s*[\w\s,/-]{10,100}?\s*\d{6}\b",
+        "[ADDRESS]"
+    )
+]
+
+# Presidio fallback with custom recognizer
+logging.info("\n Presidio Redaction Layer")
+class UHIDRecognizer(EntityRecognizer):
+    def __init__(self):
+        super().__init__(supported_entities=["UHID"])
+        self.context = ["uhid", "hospital id", "patient id"]
+
+    def load(self):
+        pass  # No model to load
+
+    def analyze(self, text, entities, nlp_artifacts):
+        pattern = re.compile(r"\b[A-Z]{2}\d{6}\b")
+        results = []
+
+        for match in pattern.finditer(text):
+            # Context window of ±20 characters
+            window = text[max(0, match.start() - 20):match.end() + 20].lower()
+
+            # Check context presence
+            if any(ctx in window for ctx in self.context):
+                explanation = AnalysisExplanation(
+                    recognizer="CustomUHIDRecognizer",
+                    original_score=0.85,
+                    textual_explanation="UHID detected using regex pattern"
+                )
+
+                result = RecognizerResult(
+                    entity_type="ID",
+                    start=match.start(),
+                    end=match.end(),
+                    score=0.85,
+                    analysis_explanation=explanation
+                )
+                results.append(result)
+
+        return results
+class HospitalNoRecognizer(EntityRecognizer):
+    def __init__(self):
+        super().__init__(supported_entities=["HOSPITAL_NO"])
+        self.context = ["hospital no", "record id"]
+
+    def load(self):
+        pass
+
+    def analyze(self, text, entities, nlp_artifacts):
+        pattern = re.compile(r"\b[A-Z]{2}\d{6,}\b")
+        results = []
+
+        for match in pattern.finditer(text):
+            window = text[max(0, match.start()-20):match.end()+20].lower()
+
+            if any(ctx in window for ctx in self.context):
+                explanation = AnalysisExplanation(
+                    recognizer="HospitalNoRecognizer",
+                    original_score=0.85,
+                    textual_explanation="Hospital number detected using regex with context"
+                )
+
+                result = RecognizerResult(
+                    entity_type="ID",
+                    start=match.start(),
+                    end=match.end(),
+                    score=0.85,
+                    analysis_explanation=explanation
+                )
+                results.append(result)
+
+        return results
+
+class MRNRecognizer(EntityRecognizer):
+    def __init__(self):
+        super().__init__(supported_entities=["MRN"])
+        self.context = ["mrn", "mrd", "med rec number"]
+
+    def load(self):
+        pass
+
+    def analyze(self, text, entities, nlp_artifacts):
+        pattern = re.compile(r"\bMR[N|D][-:]?\d+\b", re.IGNORECASE)
+        results = []
+
+        for match in pattern.finditer(text):
+            window = text[max(0, match.start()-20):match.end()+20].lower()
+
+            if any(ctx in window for ctx in self.context):
+                explanation = AnalysisExplanation(
+                    recognizer="MRNRecognizer",
+                    original_score=0.85,
+                    textual_explanation="MRN detected using regex with context"
+                )
+
+                result = RecognizerResult(
+                    entity_type="ID",
+                    start=match.start(),
+                    end=match.end(),
+                    score=0.85,
+                    analysis_explanation=explanation
+                )
+                results.append(result)
+
+        return results
+
+
+class NameRecognizer(EntityRecognizer):
+    def __init__(self):
+        super().__init__(supported_entities=["NAME"])
+        self.context = ["mr", "mrs", "dr", "patient", "name"]
+
+    def load(self):
+        pass
+
+    def analyze(self, text, entities, nlp_artifacts):
+        pattern = re.compile(r"\b(?:Dr|Mr|Mrs|Ms|Prof|Col|Maj)\.\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b")
+        results = []
+
+        for match in pattern.finditer(text):
+            window = text[max(0, match.start()-20):match.end()+20].lower()
+
+            if any(ctx in window for ctx in self.context):
+                explanation = AnalysisExplanation(
+                    recognizer="NameRecognizer",
+                    original_score=0.88,
+                    textual_explanation="Name with prefix detected using regex"
+                )
+
+                result = RecognizerResult(
+                    entity_type="NAME",
+                    start=match.start(),
+                    end=match.end(),
+                    score=0.88,
+                    analysis_explanation=explanation
+                )
+                results.append(result)
+
+        return results
+from presidio_analyzer import AnalyzerEngine, RecognizerResult, AnalysisExplanation
+from presidio_anonymizer import AnonymizerEngine
+
+analyzer = AnalyzerEngine()
+analyzer.registry.load_predefined_recognizers()
+
+# Adding custom recognizers
+analyzer.registry.add_recognizer(UHIDRecognizer())
+analyzer.registry.add_recognizer(HospitalNoRecognizer())
+analyzer.registry.add_recognizer(MRNRecognizer())
+analyzer.registry.add_recognizer(NameRecognizer())
+
+anonymizer = AnonymizerEngine()
+
+# Reduce logging
+logging.getLogger("presidio-analyzer").setLevel(logging.ERROR)
+
+# Defining allowed PII and their replacement tags
+PII_REPLACEMENTS = {
+    'CREDIT_CARD': 'CREDIT_CARD',
+    'DATE_TIME': 'DOB',
+    'EMAIL_ADDRESS': 'EMAIL',
+    'IN_AADHAAR': 'AADHAAR',
+    'IN_PAN': 'PAN',
+    'IN_PASSPORT': 'PASSPORT',
+    'IN_VEHICLE_REGISTRATION': 'ID',
+    'IN_VOTER': 'ID',
+    'IP_ADDRESS': 'IP_ADDRESS',
+    'LOCATION': 'ADDRESS',
+    'MEDICAL_LICENSE': 'ID',
+    'PERSON': 'NAME',
+    'PHONE_NUMBER': 'PHONE',
+    'URL': 'URL',
+    'UHID': 'ID',
+    'HOSPITAL_NO': 'ID',
+    'MRN': 'ID',
+    'NAME': 'NAME'
+}
+
+ALLOWED_PII_TYPES = set(PII_REPLACEMENTS.keys())
+from presidio_anonymizer.entities import OperatorConfig
+
+#Preparing Spark data
+text_list = df.select("text").rdd.flatMap(lambda x: x).collect()
+
+presidio_results = []
+redacted_outputs = []
+
+# Looping over texts and redacting custom tags
+for text in text_list:
+    pres_results = analyzer.analyze(text=text, language="en")
+    filtered_results = [r for r in pres_results if r.entity_type in ALLOWED_PII_TYPES and r.score >= 0.7]
+
+    # Build operator config for each entity type
+    operators = {
+    entity: OperatorConfig("replace", {"new_value": f"[{PII_REPLACEMENTS[entity]}]"})
+    for entity in PII_REPLACEMENTS
+}
+    redacted = anonymizer.anonymize(text, filtered_results, operators)
+    presidio_results.append((text, redacted.text))
+
+# Build Spark DataFrame and join
+presidio_df = spark.createDataFrame(presidio_results, ["text", "presidio_redacted"])
+
+final_df = df.join(presidio_df, on="text", how="left")
+final_df = final_df.withColumn("redacted_text", col("presidio_redacted"))
+
+
+def redact_text(text):
+    if not text:
+        return text
+    for pattern, repl in regex_redactions:
+        text = re.sub(pattern, repl, text)
+    return text
+
+redact_udf = udf(redact_text, StringType())
+final_df = final_df.withColumn("final_redacted", redact_udf(col("redacted_text")))
+
+# Dynamic redaction of high-confidence Spark NLP entities
+name_entities = entity_df.filter(
+    (col("entity.entity") == "PER") & (col("entity.confidence") >= 0.75)
+).select("entity.word").distinct().rdd.flatMap(lambda x: x).collect()
+
+for name in name_entities:
+    escaped = re.escape(name)
+    final_df = final_df.withColumn("redacted_text", regexp_replace("redacted_text", rf"\b{escaped}\b", "[NAME]"))
+
+from transformers import AutoTokenizer, AutoModelForTokenClassification, pipeline as hf_pipeline
+#from huggingface_hub import login
+#login()
+
+# Fallback to IndicNER for low-confidence
+low_conf_df = entity_df.filter(col("entity.confidence") < 0.75).select("text").distinct()
+
+if not low_conf_df.rdd.isEmpty():
+    tokenizer = AutoTokenizer.from_pretrained("ai4bharat/IndicNER")
+    model = AutoModelForTokenClassification.from_pretrained("ai4bharat/IndicNER")
+    indic_ner = hf_pipeline("token-classification", model=model, tokenizer=tokenizer, aggregation_strategy="simple")
+
+    low_texts = low_conf_df.rdd.flatMap(lambda x: x).collect()
+    logging.info("\n IndicNER fallback for low-confidence:")
+    indic_results = []
+
+    for text in low_texts:
+        logging.info(f"\nText: {text}")
+        for ent in indic_ner(text):
+            logging.info(f"→ {ent['word']} ({ent['entity_group']}, {ent['score']:.2f})")
+            indic_results.append((text, ent['word'], ent['entity_group'], float(ent['score'])))
+
+    indic_schema = StructType([
+        StructField("text", StringType()),
+        StructField("word", StringType()),
+        StructField("entity", StringType()),
+        StructField("confidence", FloatType())
+    ])
+    indic_df = spark.createDataFrame(indic_results, indic_schema)
+
+    for row in indic_results:
+        escaped = re.escape(row[1])
+        clean_label = row[2].strip("<>").upper()
+        final_df = final_df.withColumn(
+        "redacted_text",
+        regexp_replace("redacted_text", rf"\b{escaped}\b", f"[{clean_label}]")
+    )
+
+entity_summary.show(truncate=False)
+
+# Output final results
+for row in final_df.select("redacted_text").collect():
+    print(row['redacted_text'])
+for row in pii_table.collect():
+    print(row)
+redacted_texts = final_df.select("redacted_text").rdd.flatMap(lambda x: x).collect()
+with open("redacted_output.txt", "w", encoding="utf-8") as f:
+    for line in redacted_texts:
+        f.write(line + "\n")
+        
+from google.colab import files
+files.download("redacted_output.txt")
