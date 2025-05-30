@@ -182,7 +182,7 @@ schema = ArrayType(StructType([
 filtered_udf = udf(custom_entity_filter, schema)
 entity_df = processed_df.withColumn("entity_info", filtered_udf("entities")).withColumn("entity", explode("entity_info"))
 # Keeps rows with confidence of 0.7 or higher
-entity_df = entity_df.filter(col("entity.confidence") >= 0.70)
+entity_df = entity_df.filter(col("entity.confidence") >= 0.75)
 
 # Final table of entities
 pii_table = entity_df.select(
@@ -404,7 +404,7 @@ class NameRecognizer(EntityRecognizer):
             if any(ctx in window for ctx in self.context):
                 explanation = AnalysisExplanation(
                     recognizer="NameRecognizer",
-                    original_score=0.88,
+                    original_score=0.85,
                     textual_explanation="Name with prefix detected using regex"
                 )
 
@@ -412,7 +412,7 @@ class NameRecognizer(EntityRecognizer):
                     entity_type="NAME",
                     start=match.start(),
                     end=match.end(),
-                    score=0.88,
+                    score=0.85,
                     analysis_explanation=explanation
                 )
                 results.append(result)
